@@ -1,0 +1,18 @@
+# Optional Render Blueprint. Or create a "Web Service" by hand: Runtime = Docker, Instance = Free.
+services:
+  - type: web
+    name: whatsapp-clone-bot
+    runtime: docker
+    plan: free
+    healthCheckPath: /health
+    envVars:
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: WHITELIST
+        sync: false
+      - key: DATABASE_URL
+        sync: false
+      - key: PAGE_KEY
+        sync: false
+      - key: GEMINI_MODEL
+        value: gemini-2.5-flash
