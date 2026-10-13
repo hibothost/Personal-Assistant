@@ -6,3 +6,10 @@ __pycache__/
 *.sqlite3
 venv/
 .venv/
+chats/
+build_*.py
+test_*.py
+README.md
+render.yaml
+.env.example
+.gitignore

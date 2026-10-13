@@ -7,8 +7,9 @@ ENV PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1
 
 # libmagic1: file-type detection used by neonize (python-magic).
+# tzdata: so the bot knows today's date/time in your timezone (TIMEZONE env var).
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends libmagic1 ca-certificates \
+    && apt-get install -y --no-install-recommends libmagic1 ca-certificates tzdata \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
@@ -16,7 +17,12 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install -r requirements.txt
 
-COPY main.py .
+# main.py plus the optional knowledge/ folder built by build_knowledge.py (profile.md,
+# contacts.json, ...). .dockerignore keeps chats/, .env and the helper scripts out of the image.
+# Keep the repo PRIVATE if you commit real data in knowledge/, or use Render Secret Files
+# instead (see README).
+COPY . .
+RUN mkdir -p knowledge
 
 RUN useradd --create-home appuser && chown -R appuser /app
 USER appuser

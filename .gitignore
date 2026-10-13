@@ -1,0 +1,10 @@
+# Never commit these
+.env
+chats/
+*.db
+*.sqlite3
+# Python
+__pycache__/
+*.pyc
+venv/
+.venv/

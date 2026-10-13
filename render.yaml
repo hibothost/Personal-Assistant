@@ -8,11 +8,17 @@ services:
     envVars:
       - key: GEMINI_API_KEY
         sync: false
+      - key: DATABASE_URL
+        sync: false
       - key: WHITELIST
         sync: false
-      - key: DATABASE_URL
+      - key: NOTIFY_NUMBER
         sync: false
       - key: PAGE_KEY
         sync: false
+      - key: REPLY_MODE
+        value: whitelist
+      - key: TIMEZONE
+        value: Africa/Kampala
       - key: GEMINI_MODEL
         value: gemini-2.5-flash

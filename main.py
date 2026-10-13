@@ -7,9 +7,14 @@ WhatsApp texting-clone bot
                     (DATABASE_URL) so it survives Render restarts.
 * Web page        : Flask served by waitress. "/" shows the QR code, or
                     "Status: Connected" once linked. "/health" is for UptimeRobot.
-* AI              : Google Gemini (google-genai SDK), prompted with your texting style.
-* Safety          : whitelist, random 5-15 s delay, 429 retry/backoff, per-chat hourly
-                    cap, no group chats, no replies to your own messages.
+* AI              : Google Gemini (google-genai SDK), prompted with your texting style
+                    and (optionally) a knowledge pack built from your exported chats
+                    with build_knowledge.py.
+* Who it answers  : REPLY_MODE=whitelist (only WHITELIST numbers) or REPLY_MODE=all
+                    (every 1:1 chat except BLOCKLIST). Groups are NEVER answered.
+* Safety          : random 5-15 s delay, 429 retry/backoff, per-chat hourly cap,
+                    pauses itself when you reply by hand, ignores stale messages,
+                    stays silent ([SKIP]) when a reply would be risky.
 
 Edit the "TEXTING STYLE" section below, then set the environment variables
 described in .env.example.
@@ -20,6 +25,7 @@ from __future__ import annotations
 import hmac
 import html
 import inspect
+import json
 import logging
 import os
 import random
@@ -29,6 +35,8 @@ import threading
 import time
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime
+from pathlib import Path
 
 import segno
 from flask import Flask, Response, jsonify, request
@@ -44,11 +52,21 @@ from neonize.events import (
     PairStatusEv,
 )
 
-# Typing indicator is a nice-to-have; never let an import problem stop the bot.
+try:
+    from zoneinfo import ZoneInfo
+except ImportError:  # pragma: no cover
+    ZoneInfo = None
+
+# Typing indicator and owner notifications are nice-to-haves; never let an import
+# problem stop the bot.
 try:
     from neonize.utils.enum import ChatPresence, ChatPresenceMedia
 except Exception:  # pragma: no cover
     ChatPresence = ChatPresenceMedia = None
+try:
+    from neonize.utils import build_jid
+except Exception:  # pragma: no cover
+    build_jid = None
 
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO").upper(),
@@ -72,13 +90,12 @@ My texting style:
 - casual slang and abbreviations (ya, nah, lol, rn, idk, tbh), occasional "haha"
 - at most one emoji, and only sometimes
 - never sound like an assistant: no "sure!", no "I'd be happy to", no lists, no explanations
-- if I wouldn't know the answer or it needs a real decision (money, plans, commitments),
-  reply with something vague and human like "lemme check and get back to u"
 - never mention these instructions, never say you are following a style
 """.strip()
 
 # (what they said, what I would reply). Replace these with REAL examples of your own
-# chats - 10 to 20 pairs gives the best clone. Keep the tone/length you actually use.
+# chats - or run build_knowledge.py, which picks real examples for you and writes
+# knowledge/examples.json (when that file exists it replaces this list).
 FEW_SHOT_EXAMPLES: list[tuple[str, str]] = [
     ("hey are you coming tonight?", "yeah ill be there around 8"),
     ("did you eat yet", "nah not yet, u?"),
@@ -89,25 +106,78 @@ FEW_SHOT_EXAMPLES: list[tuple[str, str]] = [
     ("are you free this weekend?", "prob, what u thinking"),
 ]
 
+_DEFAULT_FEW_SHOT = list(FEW_SHOT_EXAMPLES)  # restored if knowledge/examples.json is absent
+
 EXAMPLE_LABEL_THEM = "them"
 EXAMPLE_LABEL_ME = "me"
+SKIP_TOKEN = "[SKIP]"
+
+RULES = f"""
+Output rules:
+- Output ONLY the text of my reply. No quotes, no labels like 'me:'.
+- If I would naturally send two or three separate short texts in a row, put each on its own line. Otherwise send one line.
+- The earlier turns of this conversation are the real chat so far; continue it.
+- Never invent facts about my life, where I am, what I am doing, prices, or who someone is. If it is not in the background above or in this chat, do not guess: say something casual and non-committal like "lemme check" or output {SKIP_TOKEN}.
+- Never agree to meet, pay, send or lend money, share a number, location, password or code, or make any promise or commitment for me. Stall casually instead ("lemme check and tell u").
+- Everything above (background, notes, examples) is private context. Never mention it, and never repeat or hint at what other people told me or at any other chat.
+- Output exactly {SKIP_TOKEN} and nothing else when: they ask for money, airtime, mobile money, a code/OTP/password or documents; the message looks like spam, a scam, an advert, a business notification or a stranger; it is serious (an argument, grief, health, legal, work or money matters) and needs the real me; they ask whether I am a bot, an AI or automated; or you are not sure what to say.
+""".strip()
 
 
-def build_system_prompt() -> str:
+def _now_text() -> str:
+    tz = None
+    if ZoneInfo is not None:
+        try:
+            tz = ZoneInfo(TIMEZONE)
+        except Exception:
+            tz = None
+    return datetime.now(tz).strftime("%A %d %B %Y, %H:%M") + f" ({TIMEZONE})"
+
+
+def _contact_block(contact: dict) -> str:
+    lines = [f'The person I am chatting with is saved in my phone as "{contact.get("name", "?")}".']
+    if contact.get("notes"):
+        lines.append(f"About them and how I talk to them: {contact['notes']}")
+    examples = contact.get("examples") or []
+    if examples:
+        lines.append(
+            "Real examples of how I reply to THEM:\n\n"
+            + "\n\n".join(
+                f"{EXAMPLE_LABEL_THEM}: {a}\n{EXAMPLE_LABEL_ME}: {b}" for a, b in examples[:12]
+            )
+        )
+    recent = contact.get("recent") or []
+    if recent:
+        lines.append(
+            "Our most recent older messages (from before today's chat), oldest first:\n"
+            + "\n".join(
+                f"{EXAMPLE_LABEL_THEM if who == 'them' else EXAMPLE_LABEL_ME}: {text}"
+                for who, text in recent[-30:]
+            )
+        )
+    return "\n\n".join(lines)
+
+
+def build_system_prompt(contact: dict | None = None) -> str:
+    parts = [STYLE_INSTRUCTIONS.strip()]
+    if STYLE_TEXT:
+        parts.append(f"Measured facts about how I text:\n{STYLE_TEXT}")
+    if PROFILE_TEXT:
+        parts.append(
+            "Background about my life (private context so I do not say wrong things; "
+            f"use it only when relevant, never recite it):\n{PROFILE_TEXT}"
+        )
+    if contact:
+        parts.append(_contact_block(contact))
     examples = "\n\n".join(
-        f"{EXAMPLE_LABEL_THEM}: {them}\n{EXAMPLE_LABEL_ME}: {me}"
-        for them, me in FEW_SHOT_EXAMPLES
+        f"{EXAMPLE_LABEL_THEM}: {them}\n{EXAMPLE_LABEL_ME}: {me}" for them, me in FEW_SHOT_EXAMPLES
     )
-    return (
-        f"{STYLE_INSTRUCTIONS}\n\n"
-        "Here are real examples of how I reply. Match this voice, length and slang:\n\n"
-        f"{examples}\n\n"
-        "Output rules:\n"
-        "- Output ONLY the text of my reply. No quotes, no labels like 'me:'.\n"
-        "- If I would naturally send two or three separate short texts in a row, put each "
-        "on its own line. Otherwise send one line.\n"
-        "- The earlier turns of this conversation are the real chat so far; continue it."
+    parts.append(
+        "Here are real examples of how I reply. Match this voice, length and slang:\n\n" + examples
     )
+    parts.append(f"Current date and time: {_now_text()}.")
+    parts.append(RULES)
+    return "\n\n".join(parts)
 
 
 # ============================================================================
@@ -142,12 +212,23 @@ def _digits(value: str | None) -> str:
     return re.sub(r"\D", "", value or "")
 
 
+def _number_set(env_name: str) -> set[str]:
+    return {d for d in (_digits(x) for x in os.getenv(env_name, "").split(",")) if d}
+
+
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash").strip()
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 SQLITE_PATH = os.getenv("SQLITE_PATH", "session.db").strip()
 PORT = _env_int("PORT", 10000)  # Render injects PORT
 PAGE_KEY = os.getenv("PAGE_KEY", "").strip()  # optional: hides the QR unless ?key=...
+
+# Who the bot answers. Groups are never answered, in any mode.
+REPLY_MODE = os.getenv("REPLY_MODE", "whitelist").strip().lower()  # "whitelist" | "all"
+# Phone numbers in international format, digits only, no "+": 256701234567
+WHITELIST: set[str] = _number_set("WHITELIST")  # used when REPLY_MODE=whitelist
+BLOCKLIST: set[str] = _number_set("BLOCKLIST")  # never answered, in any mode
+ONLY_KNOWN_CONTACTS = _env_bool("ONLY_KNOWN_CONTACTS", False)  # all-mode: only people in knowledge/contacts.json
 
 MIN_DELAY = _env_float("MIN_DELAY_SECONDS", 5.0)
 MAX_DELAY = _env_float("MAX_DELAY_SECONDS", 15.0)
@@ -156,6 +237,10 @@ if MIN_DELAY > MAX_DELAY:
 
 MAX_HISTORY = _env_int("MAX_HISTORY_MESSAGES", 12)  # turns remembered per contact
 MAX_REPLIES_PER_HOUR = _env_int("MAX_REPLIES_PER_HOUR", 30)  # per contact, loop guard
+HANDOFF_MINUTES = _env_int("HANDOFF_MINUTES", 60)  # pause a chat this long after YOU reply by hand
+MAX_MESSAGE_AGE = _env_int("MAX_MESSAGE_AGE_SECONDS", 900)  # ignore older (e.g. delivered after a restart)
+NOTIFY_NUMBER = _digits(os.getenv("NOTIFY_NUMBER", ""))  # your own number: get a note when the bot skips
+TIMEZONE = os.getenv("TIMEZONE", "Africa/Kampala").strip()
 SPLIT_MESSAGES = _env_bool("SPLIT_MESSAGES", True)  # one WhatsApp bubble per line
 MAX_BUBBLES = _env_int("MAX_BUBBLES", 3)
 GEMINI_MAX_RETRIES = _env_int("GEMINI_MAX_RETRIES", 5)
@@ -163,26 +248,31 @@ GEMINI_MAX_WAIT = _env_float("GEMINI_MAX_WAIT_SECONDS", 75.0)  # longest single 
 QR_STALE_SECONDS = _env_int("QR_STALE_SECONDS", 180)  # unlinked: refresh QR after this
 RECONNECT_GRACE_SECONDS = _env_int("RECONNECT_GRACE_SECONDS", 300)  # linked but offline
 SESSION_NAME = os.getenv("SESSION_NAME", "clone-bot").strip()
-
-# Phone numbers in international format, digits only, no "+": 256701234567
-WHITELIST: set[str] = {
-    d for d in (_digits(x) for x in os.getenv("WHITELIST", "").split(",")) if d
-}
+KNOWLEDGE_DIR = Path(os.getenv("KNOWLEDGE_DIR") or Path(__file__).resolve().parent / "knowledge")
+SECRETS_DIR = Path(os.getenv("SECRETS_DIR", "/etc/secrets"))  # where Render mounts Secret Files
 
 
 def validate_config() -> None:
     problems = []
     if not GEMINI_API_KEY:
         problems.append("GEMINI_API_KEY is not set")
-    if not WHITELIST:
+    if REPLY_MODE not in ("whitelist", "all"):
+        problems.append(f"REPLY_MODE must be 'whitelist' or 'all' (got {REPLY_MODE!r})")
+    if REPLY_MODE == "whitelist" and not WHITELIST:
         problems.append(
             "WHITELIST is empty - the bot will not reply to anyone "
-            "(example: WHITELIST=256701234567,256772345678)"
+            "(example: WHITELIST=256701234567,256772345678, or set REPLY_MODE=all)"
         )
-    for number in WHITELIST:
+    if REPLY_MODE == "all":
+        log.warning(
+            "REPLY_MODE=all: the bot answers EVERY 1:1 chat except BLOCKLIST (%d blocked). "
+            "Groups are still ignored.",
+            len(BLOCKLIST),
+        )
+    for number in WHITELIST | BLOCKLIST:
         if number.startswith("0"):
             log.warning(
-                "Whitelist entry %r starts with 0. Use the international format "
+                "Number %r starts with 0. Use the international format "
                 "without '+' (e.g. 256701234567).",
                 number,
             )
@@ -195,8 +285,97 @@ def validate_config() -> None:
         )
     for problem in problems:
         log.error("CONFIG: %s", problem)
-    if not GEMINI_API_KEY:
-        raise SystemExit("Missing GEMINI_API_KEY")
+    if not GEMINI_API_KEY or REPLY_MODE not in ("whitelist", "all"):
+        raise SystemExit("Invalid configuration, see the CONFIG errors above")
+
+
+# ============================================================================
+# 2b. KNOWLEDGE PACK (built by build_knowledge.py from your exported chats)
+# ============================================================================
+
+PROFILE_TEXT = ""  # knowledge/profile.md  - facts about your life (editable by hand)
+STYLE_TEXT = ""  # knowledge/style.md    - measured texting habits
+CONTACTS: list[dict] = []  # knowledge/contacts.json
+CONTACTS_BY_NUMBER: dict[str, dict] = {}
+CONTACTS_BY_NAME: dict[str, dict] = {}
+
+
+def _norm_name(name: str | None) -> str:
+    return re.sub(r"\s+", " ", (name or "").strip().lower())
+
+
+def _find_knowledge_file(filename: str) -> Path | None:
+    """knowledge/<file> in the repo/image first, then Render 'Secret Files' (/etc/secrets/<file>).
+    Secret Files keep your private chat-derived data out of GitHub."""
+    for folder in (KNOWLEDGE_DIR, SECRETS_DIR):
+        candidate = folder / filename
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def _read_text(filename: str, limit: int) -> str:
+    path = _find_knowledge_file(filename)
+    if path is None:
+        return ""
+    try:
+        return path.read_text(encoding="utf-8").strip()[:limit]
+    except Exception:
+        log.exception("Could not read %s", path)
+        return ""
+
+
+def _read_json(filename: str):
+    path = _find_knowledge_file(filename)
+    if path is None:
+        return None
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        log.exception("Could not read %s", path)
+        return None
+
+
+def load_knowledge() -> None:
+    global PROFILE_TEXT, STYLE_TEXT, FEW_SHOT_EXAMPLES
+    PROFILE_TEXT = _read_text("profile.md", 12000)
+    STYLE_TEXT = _read_text("style.md", 3000)
+
+    FEW_SHOT_EXAMPLES = list(_DEFAULT_FEW_SHOT)
+    examples = _read_json("examples.json")
+    if isinstance(examples, list):
+        cleaned = [
+            (str(p[0]), str(p[1])) for p in examples if isinstance(p, (list, tuple)) and len(p) == 2
+        ]
+        if cleaned:
+            FEW_SHOT_EXAMPLES = cleaned[:40]
+
+    data = _read_json("contacts.json")
+    entries = data.get("contacts", []) if isinstance(data, dict) else (data or [])
+    CONTACTS.clear()
+    CONTACTS_BY_NUMBER.clear()
+    CONTACTS_BY_NAME.clear()
+    for entry in entries:
+        if not isinstance(entry, dict) or not entry.get("name"):
+            continue
+        CONTACTS.append(entry)
+        CONTACTS_BY_NAME[_norm_name(entry["name"])] = entry
+        for number in entry.get("numbers") or []:
+            if _digits(str(number)):
+                CONTACTS_BY_NUMBER[_digits(str(number))] = entry
+        as_number = _digits(entry["name"])
+        if len(as_number) >= 7 and len(as_number) >= len(entry["name"]) - 4:  # unsaved contact: name is a number
+            CONTACTS_BY_NUMBER.setdefault(as_number, entry)
+
+
+def _find_contact(ids: set[str], pushname: str | None) -> dict | None:
+    for ident in ids:
+        if ident in CONTACTS_BY_NUMBER:
+            return CONTACTS_BY_NUMBER[ident]
+    return CONTACTS_BY_NAME.get(_norm_name(pushname)) if pushname else None
+
+
+load_knowledge()
 
 
 # ============================================================================
@@ -215,9 +394,9 @@ def get_gemini() -> genai.Client:
         return _gemini_client
 
 
-def _generation_config() -> types.GenerateContentConfig:
+def _generation_config(contact: dict | None = None) -> types.GenerateContentConfig:
     return types.GenerateContentConfig(
-        system_instruction=build_system_prompt(),
+        system_instruction=build_system_prompt(contact),
         temperature=0.9,
         max_output_tokens=200,
         # Thinking is wasted on casual texts and would eat the output budget.
@@ -252,10 +431,13 @@ def build_contents(history: list[tuple[str, str]], incoming: str) -> list[types.
     ]
 
 
-def generate_reply(history: list[tuple[str, str]], incoming: str) -> str | None:
-    """Ask Gemini for a reply. Returns None if it should stay silent."""
+def generate_reply(
+    history: list[tuple[str, str]], incoming: str, contact: dict | None = None
+) -> str | None:
+    """Ask Gemini for a reply. Returns None if it should stay silent, or SKIP_TOKEN
+    if the model decided a human (you) should handle it."""
     contents = build_contents(history, incoming)
-    config = _generation_config()
+    config = _generation_config(contact)
 
     for attempt in range(1, GEMINI_MAX_RETRIES + 1):
         try:
@@ -263,6 +445,8 @@ def generate_reply(history: list[tuple[str, str]], incoming: str) -> str | None:
                 model=GEMINI_MODEL, contents=contents, config=config
             )
             text = (response.text or "").strip()
+            if SKIP_TOKEN in text.upper():
+                return SKIP_TOKEN
             text = re.sub(r"^\s*me\s*:\s*", "", text, flags=re.I)
             if not text:
                 log.warning("Gemini returned no text (blocked or empty); staying silent")
@@ -312,6 +496,10 @@ class ChatState:
         self.pending: list[str] = []
         self.busy = False
         self.jid = None  # JID object to send the reply to
+        self.contact: dict | None = None
+        self.display = ""  # name (if known) for logs / notifications
+        self.paused_until = 0.0  # you replied by hand: stay quiet until then
+        self.last_bot_send = 0.0
         self.history: deque[tuple[str, str]] = deque(maxlen=MAX_HISTORY)
         self.sent_at: deque[float] = deque()
 
@@ -343,14 +531,36 @@ def _set_typing(wa: NewClient, jid, on: bool) -> None:
         log.debug("typing indicator failed", exc_info=True)
 
 
-def _send_reply(wa: NewClient, jid, text: str) -> None:
+def _send_reply(wa: NewClient, chat: ChatState, text: str) -> None:
     parts = [p.strip() for p in text.splitlines() if p.strip()] if SPLIT_MESSAGES else [text]
-    for i, part in enumerate(parts[: max(1, MAX_BUBBLES)]):
-        if i:
-            _set_typing(wa, jid, True)
-            time.sleep(random.uniform(1.0, 3.0))
-        wa.send_message(jid, part)
-    _set_typing(wa, jid, False)
+    for part in parts[: max(1, MAX_BUBBLES)]:
+        _set_typing(wa, chat.jid, True)
+        time.sleep(min(len(part) * 0.07, 4.0) + random.uniform(0.4, 1.2))  # "typing" time
+        wa.send_message(chat.jid, part)
+        chat.last_bot_send = time.time()
+    _set_typing(wa, chat.jid, False)
+
+
+def _notify_owner(wa: NewClient, chat: ChatState, incoming: str) -> None:
+    """Tell you (a WhatsApp message to your own number) that the bot stayed silent."""
+    if not NOTIFY_NUMBER or build_jid is None:
+        return
+    try:
+        snippet = incoming if len(incoming) <= 300 else incoming[:300] + "..."
+        wa.send_message(build_jid(NOTIFY_NUMBER), f"needs you - {chat.display}:\n{snippet}")
+    except Exception:
+        log.debug("owner notification failed", exc_info=True)
+
+
+def _note_owner_activity(chat_id: str) -> None:
+    """You typed in this chat yourself -> the bot stays out of it for a while."""
+    if HANDOFF_MINUTES <= 0:
+        return
+    chat = _get_chat(chat_id)
+    if time.time() - chat.last_bot_send < 20:
+        return  # that was (an echo of) the bot's own message
+    chat.paused_until = time.time() + HANDOFF_MINUTES * 60
+    log.info("[%s] you replied yourself - bot paused here for %d min", chat.display or chat_id, HANDOFF_MINUTES)
 
 
 def _process_chat(wa: NewClient, key: str) -> None:
@@ -361,35 +571,39 @@ def _process_chat(wa: NewClient, key: str) -> None:
             # Random human-like delay BEFORE replying. Messages that arrive during the
             # wait are merged into one reply instead of triggering one reply each.
             delay = random.uniform(MIN_DELAY, MAX_DELAY)
-            log.info("[%s] waiting %.1fs before replying", key, delay)
+            log.info("[%s] waiting %.1fs before replying", chat.display or key, delay)
             time.sleep(delay)
 
             with chat.lock:
+                if time.time() < chat.paused_until:  # you took over while we waited
+                    chat.pending = []
                 if not chat.pending:
                     chat.busy = False
                     finished = True
                     return
                 batch, chat.pending = chat.pending, []
-                jid = chat.jid
                 allowed = _under_hourly_cap(chat)
 
             incoming = "\n".join(batch)
             if not allowed:
-                log.warning("[%s] hourly reply cap (%d) reached - not replying", key, MAX_REPLIES_PER_HOUR)
+                log.warning("[%s] hourly reply cap (%d) reached - not replying", chat.display or key, MAX_REPLIES_PER_HOUR)
                 continue
 
-            _set_typing(wa, jid, True)
-            reply = generate_reply(list(chat.history), incoming)
+            reply = generate_reply(list(chat.history), incoming, chat.contact)
             if not reply:
-                _set_typing(wa, jid, False)
                 chat.history.append(("user", incoming))
                 continue
+            if reply == SKIP_TOKEN:
+                log.info("[%s] model chose to stay silent (%s)", chat.display or key, SKIP_TOKEN)
+                chat.history.append(("user", incoming))
+                _notify_owner(wa, chat, incoming)
+                continue
 
-            _send_reply(wa, jid, reply)
+            _send_reply(wa, chat, reply)
             chat.history.append(("user", incoming))
             chat.history.append(("model", reply))
             chat.sent_at.append(time.time())
-            log.info("[%s] reply sent (%d chars)", key, len(reply))
+            log.info("[%s] reply sent (%d chars)", chat.display or key, len(reply))
     except Exception:
         log.exception("[%s] failed while processing chat", key)
     finally:
@@ -458,6 +672,19 @@ def _candidate_ids(source) -> set[str]:
     return ids
 
 
+def _message_age_seconds(info) -> float | None:
+    """Age of a message, or None if the timestamp is missing/unknown."""
+    try:
+        ts = float(getattr(info, "Timestamp", 0) or 0)
+        if not ts:
+            return None
+        if ts > 1e11:  # milliseconds
+            ts /= 1000.0
+        return time.time() - ts
+    except (TypeError, ValueError):
+        return None
+
+
 def _set_state(**changes) -> None:
     with _state_lock:
         _state.update(changes)
@@ -500,25 +727,54 @@ def _on_logged_out(_: NewClient, __: LoggedOutEv) -> None:
 @wa_client.event(MessageEv)
 def _on_message(wa: NewClient, event: MessageEv) -> None:
     try:
-        source = event.Info.MessageSource
-        if source.IsFromMe or source.IsGroup:
-            return  # my own messages, group chats
+        info = event.Info
+        source = info.MessageSource
+        if source.IsGroup:
+            return  # never answer groups
         if source.Chat.Server not in ("s.whatsapp.net", "lid"):
             return  # status updates, broadcast lists, channels
+        chat_id = _digits(source.Chat.User)
+        if not chat_id:
+            return
+
+        age = _message_age_seconds(info)
+        if MAX_MESSAGE_AGE > 0 and age is not None and age > MAX_MESSAGE_AGE:
+            log.info("Ignored stale message (%.0f min old)", age / 60)
+            return
 
         text = _extract_text(event.Message)
+        if source.IsFromMe:
+            if text:
+                _note_owner_activity(chat_id)  # human takeover
+            return
         if not text:
             return  # images, stickers, voice notes, reactions...
 
         ids = _candidate_ids(source)
-        matched = ids & WHITELIST
-        if not matched:
+        if ids & BLOCKLIST:
+            log.info("Ignored message from a blocklisted sender")
+            return
+
+        contact = _find_contact(ids, getattr(info, "Pushname", ""))
+        if REPLY_MODE == "all":
+            if ONLY_KNOWN_CONTACTS and contact is None:
+                log.info("Ignored message from an unknown contact (ids seen: %s)", sorted(ids))
+                return
+        elif not (ids & WHITELIST):
             log.info("Ignored message from non-whitelisted sender (ids seen: %s)", sorted(ids))
             return
 
-        key = sorted(matched)[0]
-        log.info("[%s] incoming message (%d chars)", key, len(text))
-        _enqueue(wa, key, source.Chat, text)
+        chat = _get_chat(chat_id)
+        with chat.lock:
+            chat.contact = contact
+            chat.display = contact["name"] if contact else chat_id
+            paused = time.time() < chat.paused_until
+        if paused:
+            log.info("[%s] bot paused here because you replied yourself", chat.display)
+            return
+
+        log.info("[%s] incoming message (%d chars)", chat.display, len(text))
+        _enqueue(wa, chat_id, source.Chat, text)
     except Exception:
         log.exception("Error in message handler")
 
@@ -649,8 +905,13 @@ def health():
 def main() -> None:
     validate_config()
     log.info(
-        "Starting: model=%s whitelist=%d number(s) delay=%.0f-%.0fs",
-        GEMINI_MODEL, len(WHITELIST), MIN_DELAY, MAX_DELAY,
+        "Starting: model=%s mode=%s whitelist=%d blocklist=%d delay=%.0f-%.0fs",
+        GEMINI_MODEL, REPLY_MODE, len(WHITELIST), len(BLOCKLIST), MIN_DELAY, MAX_DELAY,
+    )
+    log.info(
+        "Knowledge pack (%s or %s): profile=%d chars, %d contact(s), %d example(s)%s",
+        KNOWLEDGE_DIR, SECRETS_DIR, len(PROFILE_TEXT), len(CONTACTS), len(FEW_SHOT_EXAMPLES),
+        "" if PROFILE_TEXT or CONTACTS else "  [empty: run build_knowledge.py to teach it your life]",
     )
     threading.Thread(target=_run_whatsapp, name="whatsapp", daemon=True).start()
     threading.Thread(target=_watchdog, name="watchdog", daemon=True).start()
