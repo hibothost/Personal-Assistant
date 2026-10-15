@@ -59,10 +59,16 @@ HEADER = re.compile(
 )
 SENDER = re.compile(r"^(?P<name>[^:]{1,100}?):\s(?P<body>.*)$")
 
+# Lines WhatsApp itself inserts (on iPhone exports they even carry the contact's name as "sender").
 NOISE = re.compile(
     r"^(?:<?media omitted>?|<attached: .*>|.*\(file attached\)|"
     r"(?:image|video|audio|sticker|gif|document|contact card|voice message) omitted|"
-    r"this message was deleted|you deleted this message|missed (?:voice|video) call.*|null|location: .*)$",
+    r"this message was deleted\.?|you deleted this message\.?|missed (?:voice|video) call.*|"
+    r"(?:voice|video) call(?:,.*)?|null|location: .*|"
+    r".*(?:updated the message timer|turned (?:on|off) disappearing messages|"
+    r"changed (?:their|his|her) phone number|security code changed|"
+    r"messages and calls are end-to-end encrypted|you (?:un)?blocked this contact|"
+    r"waiting for this message|change timer).*)$",
     re.I,
 )
 EDITED = re.compile(r"\s*<this message was edited>\s*$", re.I)
@@ -223,8 +229,18 @@ _EMAIL = re.compile(r"\S+@\S+\.\S+")
 _LONG_DIGITS = re.compile(r"\d[\d\s\-]{5,}\d")
 _SENSITIVE_WORDS = re.compile(
     r"\b(?:otp|password|passcode|pin|cvv|momo|mobile money|airtime|loan|account (?:number|no)|"
-    r"send (?:me )?money|bank|salary|pay(?:ment)?|invoice)\b",
+    r"send (?:me )?money|money|cash|ugx|shillings?|mtn|airtel|bank|salary|pay(?:ment)?|invoice|"
+    # jokes or talk about crime: harmless between friends, an embarrassing blunder if the bot repeats them
+    r"scam(?:s|ming)?|illegal|dark ?web|vpn|steal(?:ing)?|hack(?:ing|ed)?|confidential)\b",
     re.I,
+)
+_MONEY = re.compile(r"\b\d+(?:[.,]\d+)?\s?k\b", re.I)  # "50k", "2.5k"
+# Never used as GLOBAL examples (those are shown in every chat): affectionate or health-related lines.
+_INTIMATE = re.compile(
+    r"\b(?:love|luv|boo|babe|baby|honey|sweetie|sweetheart|darling|dear|kiss|cuddle|miss you|mob)\b", re.I
+)
+_HEALTH = re.compile(
+    r"\b(?:chest|sick|hospital|clinic|doctor|pain|malaria|medicine|pills|check-?up|headache|fever)\b", re.I
 )
 _MID_CAPS = re.compile(r"(?<=\s)[A-Z][a-z]{2,}")  # capitalised word mid-sentence: likely a name
 _EMOJI = re.compile("[\U0001F300-\U0001FAFF☀-➿\U0001F000-\U0001F2FF]")
@@ -242,7 +258,10 @@ def redact(text: str) -> str:
 
 
 def is_sensitive(text: str) -> bool:
-    return bool(_URL.search(text) or _EMAIL.search(text) or _LONG_DIGITS.search(text) or _SENSITIVE_WORDS.search(text))
+    return bool(
+        _URL.search(text) or _EMAIL.search(text) or _LONG_DIGITS.search(text)
+        or _SENSITIVE_WORDS.search(text) or _MONEY.search(text)
+    )
 
 
 def _ranges(hours: list[int]) -> str:
@@ -335,10 +354,11 @@ def build_pairs(chat: Chat, max_gap_minutes: int = 30) -> list[dict]:
 def pick_global_examples(all_pairs: list[dict], n: int, seed: int, per_contact: int = 4) -> list[list[str]]:
     """Short, name-free pairs from many different contacts (kept generic on purpose)."""
     rng = random.Random(seed)
-    pool = [
-        p for p in all_pairs
-        if len(p["them"]) + len(p["me"]) <= 110 and not _MID_CAPS.search(p["them"]) and not _MID_CAPS.search(p["me"])
-    ]
+    def generic(p: dict) -> bool:
+        both = p["them"] + "\n" + p["me"]
+        return not (_MID_CAPS.search(both) or _INTIMATE.search(both) or _HEALTH.search(both))
+
+    pool = [p for p in all_pairs if len(p["them"]) + len(p["me"]) <= 110 and generic(p)]
     pool.sort(key=lambda p: p["when"], reverse=True)
     pool = pool[: max(n * 8, 200)]
     rng.shuffle(pool)
@@ -586,14 +606,18 @@ def main(argv: list[str] | None = None) -> int:
     for chat in chats:
         prev = old.get(chat.name, {})
         pairs = sorted(per_chat_pairs[chat.name], key=lambda p: p["when"], reverse=True)[:12][::-1]
-        entries.append({
+        entry = {
             "name": chat.name,
             "numbers": prev.get("numbers", []),
             "messages": len(chat.msgs),
             "notes": notes.get(chat.name) or prev.get("notes", ""),
             "examples": [[p["them"], p["me"]] for p in pairs],
             "recent": recent_messages(chat, args.recent),
-        })
+        }
+        for kept in ("apology", "flirt", "aliases"):  # settings you add by hand survive a re-run
+            if prev.get(kept):
+                entry[kept] = prev[kept]
+        entries.append(entry)
     _write_json(out / "contacts.json", {"contacts": entries})
     missing = sum(1 for e in entries if not e["numbers"] and len(re.sub(r"\D", "", e["name"])) < 7)
     print(f"  wrote contacts.json ({len(entries)} contacts; {missing} still need a phone number in \"numbers\")")

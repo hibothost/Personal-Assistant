@@ -18,6 +18,8 @@ services:
         sync: false
       - key: REPLY_MODE
         value: whitelist
+      - key: APOLOGY_MODE
+        value: light
       - key: TIMEZONE
         value: Africa/Kampala
       - key: GEMINI_MODEL

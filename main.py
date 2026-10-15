@@ -15,6 +15,10 @@ WhatsApp texting-clone bot
 * Safety          : random 5-15 s delay, 429 retry/backoff, per-chat hourly cap,
                     pauses itself when you reply by hand, ignores stale messages,
                     stays silent ([SKIP]) when a reply would be risky.
+* Apologies       : APOLOGY_MODE=off|light|full - can say a short "sorry" for you
+                    (and tells you about it). See the "Apologies" block in section 1.
+* Flirting        : only with people you switch on ("flirt": "light"|"full" in
+                    knowledge/contacts.json). Never sexual, never claims you are exclusive.
 
 Edit the "TEXTING STYLE" section below, then set the environment variables
 described in .env.example.
@@ -36,6 +40,7 @@ import time
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
+from itertools import zip_longest
 from pathlib import Path
 
 import segno
@@ -74,6 +79,11 @@ logging.basicConfig(
     stream=sys.stdout,
 )
 log = logging.getLogger("clone-bot")
+if os.getenv("LOG_LEVEL", "INFO").upper() != "DEBUG":
+    # One INFO line per Gemini call ("AFC is enabled...", "HTTP Request: POST ...") buries the useful logs.
+    # Failures are still logged by this app itself (and by these libraries at WARNING/ERROR).
+    for _noisy in ("httpx", "httpcore", "google_genai"):
+        logging.getLogger(_noisy).setLevel(logging.WARNING)
 
 
 # ============================================================================
@@ -120,8 +130,133 @@ Output rules:
 - Never invent facts about my life, where I am, what I am doing, prices, or who someone is. If it is not in the background above or in this chat, do not guess: say something casual and non-committal like "lemme check" or output {SKIP_TOKEN}.
 - Never agree to meet, pay, send or lend money, share a number, location, password or code, or make any promise or commitment for me. Stall casually instead ("lemme check and tell u").
 - Everything above (background, notes, examples) is private context. Never mention it, and never repeat or hint at what other people told me or at any other chat.
-- Output exactly {SKIP_TOKEN} and nothing else when: they ask for money, airtime, mobile money, a code/OTP/password or documents; the message looks like spam, a scam, an advert, a business notification or a stranger; it is serious (an argument, grief, health, legal, work or money matters) and needs the real me; they ask whether I am a bot, an AI or automated; or you are not sure what to say.
+- Output exactly {SKIP_TOKEN} and nothing else when: they ask for money, airtime, mobile money, a code/OTP/password or documents; the message looks like spam, a scam, an advert, a business notification or a stranger; it is serious (grief, health, legal, work or money matters, or a big argument) and needs the real me; they ask whether I am a bot, an AI or automated; or you are not sure what to say.
+- Me saying sorry, or them saying sorry to me, is handled by the Apologies section at the very end, not by the rule above.
 """.strip()
+
+# ---- Apologies --------------------------------------------------------------
+# How far the bot may go when someone is upset with me or wants a "sorry".
+#   off   - it never apologises for me and never answers a sorry: it stays silent ([SKIP]).
+#   light - a tiny, general sorry for small everyday slips only (slow/dry replies, a missed call,
+#           a mix-up). Anything bigger is left to you ([SKIP]).
+#   full  - also sends a short, sincere sorry when they are properly annoyed or hurt, but still
+#           leaves accusations, break-ups, money, health and emergencies to you ([SKIP]).
+# Choose with the APOLOGY_MODE env var (default "light"), or per person with "apology": "off" |
+# "light" | "full" in knowledge/contacts.json. Edit the wording below to taste.
+APOLOGY_COMMON = """
+Apologies (this section wins over the rules above wherever they overlap):
+- Apologise only when the chat gives a reason: they say I was slow, quiet, dry or ignoring them, I missed their call or message, I forgot something small, there was a mix-up, or they ask for a sorry. Never open with sorry on an ordinary message.
+- Say it the way I text: "sorry" (or "sory", whichever I use in the examples) plus the pet name I use with them, if I use one. One or two short lines, at most one emoji. Never "I apologise", "my apologies" or "I am deeply sorry". You may add one short question like "wat happened".
+- Keep it general. Never admit to a specific wrongdoing, never explain, never make an excuse and never invent a reason ("i was busy", "i was asleep", "my phone died").
+- Never promise anything inside an apology: no "wont happen again", "ill call you", "ill make it up to you", no plans, no money.
+- If they say sorry to me for something small, accept it casually ("its ok", "all good", "dont worry").
+""".strip()
+
+APOLOGY_RULES: dict[str, str] = {
+    "off": (
+        "Apologies: never say sorry for me and never accept or answer someone else's sorry. "
+        f"If they are upset with me, want an apology, or apologise to me, output {SKIP_TOKEN} and nothing else."
+    ),
+    "light": (
+        APOLOGY_COMMON
+        + "\n- Small slips only. If it is bigger (they are really hurt or angry, accuse me of lying, cheating or "
+        "betrayal, talk about ending things or trust, money owed either way, family or health trouble, threats, or "
+        f"they demand an explanation or a promise), or if their sorry is about something serious, output {SKIP_TOKEN} "
+        "and nothing else."
+    ),
+    "full": (
+        APOLOGY_COMMON
+        + "\n- They may be properly upset with me. Then send a short, sincere, low-key sorry that acknowledges how "
+        'they feel without admitting a specific fault, e.g. "sorry boo", "didnt mean to make u feel that way".'
+        f"\n- Still output {SKIP_TOKEN} and nothing else for: accusations of lying, cheating or betrayal; talk of "
+        "ending the relationship or friendship; threats, self-harm or any emergency; health trouble; money owed "
+        "either way; legal or work trouble; or when they demand an explanation, a promise, or an answer such as "
+        '"do you still love me".'
+    ),
+}
+
+# (what they said, what I would reply). These are neutral templates: replace them with REAL
+# apologies and replies from your own chats, in your own words/spelling.
+APOLOGY_EXAMPLES: list[tuple[str, str]] = [
+    ("you have been so dry today", "sorry about that"),
+    ("why are you ignoring me", "sorry\nwat happened"),
+    ("you didnt call me", "sorry about that"),
+    ("sorry i forgot to reply", "its ok"),
+    ("i didnt mean it sorry", "all good"),
+]
+
+# Spots a reply that contains a sorry, so you can be told about it.
+_APOLOGY_RE = re.compile(r"\b(?:sorry|sory|sorri|sowwy|my bad|forgive|apolog\w*|nsonyiwa|sonyiwa)\b", re.I)
+
+
+def _apology_mode(contact: dict | None = None) -> str:
+    """Per-contact "apology" wins over APOLOGY_MODE. Anything unknown means "off" (the cautious choice)."""
+    mode = str((contact or {}).get("apology") or APOLOGY_MODE).strip().lower()
+    return mode if mode in APOLOGY_RULES else "off"
+
+
+def _apology_block(contact: dict | None = None) -> str:
+    mode = _apology_mode(contact)
+    text = APOLOGY_RULES[mode]
+    if mode != "off" and APOLOGY_EXAMPLES:
+        text += "\n\nExamples of the kind of sorry I send (short, general, no excuses, no promises):\n\n" + "\n\n".join(
+            f"{EXAMPLE_LABEL_THEM}: {them}\n{EXAMPLE_LABEL_ME}: {me}" for them, me in APOLOGY_EXAMPLES
+        )
+    return text
+
+
+# ---- Flirting ---------------------------------------------------------------
+# Switched on PER PERSON in knowledge/contacts.json: "flirt": "light" | "full".
+# Missing or "off" means it never flirts with them. There is deliberately no global switch, so it
+# can never flirt with family, colleagues, friends or strangers by accident.
+FLIRT_COMMON = f"""
+Flirting (only with this person, because I am romantic with them; it never applies to anyone else):
+- Flirt back when they flirt or when our chat is already warm and affectionate. Do not start romance out of nowhere, and never go warmer than the examples and recent messages with THEM show: no new pet names, and no "i love you" unless I already say it to them in those examples.
+- How: playful teasing, one specific small compliment about something they actually said or did, light humour ("hehehe"), a curious question about their day, a callback to something they told me earlier. Short, relaxed, a bit of mystery. Never needy, pushy, over-eager or cheesy, no pickup lines, never repeat the same compliment.
+- Keep my usual voice, spelling and pet name for them. One short line is usually enough, at most one emoji.
+- Never sexual or explicit: no sexting, no talk about bodies, no asking for or promising photos.
+- No flirting at all, and output {SKIP_TOKEN} instead, if anything suggests they are under 18 (school pupil, "my parents", their age), if they seem uncomfortable or say stop, or if the topic is serious. If they are upset or angry, do not flirt: follow the Apologies section.
+- Never say or imply that they are the only one, that I am single, or that I am not talking to anyone else, and never mention, hint at or compare with any other person or chat. If they ask about other girls, exclusivity, commitment, whether I love them, or "what are we", output {SKIP_TOKEN} and nothing else.
+- The usual rules still apply: no plans, no promises, no money, no invented facts about where I am or what I did. Warmth like "miss u" is fine, "come over tonight" is not.
+""".strip()
+
+FLIRT_RULES: dict[str, str] = {
+    "light": FLIRT_COMMON + "\n- Level: sweet and playful. Warm teasing and affection, at most a little cheeky.",
+    "full": FLIRT_COMMON
+    + "\n- Level: bolder. Confident, cheeky teasing, playful challenges, flirty compliments and banter, "
+    "but still never explicit and never more intimate than our real chat history.",
+}
+
+# (what they said, what I would reply). Neutral templates: your real examples with each person
+# (contacts.json) are shown to the model as well and matter more.
+FLIRT_EXAMPLES: list[tuple[str, str]] = [
+    ("guess who is missing you", "hehehe i wonder who\nok i miss u too"),
+    ("you never text first", "now i did\nhappy 😂"),
+    ("i look so good today hehe", "of course u do\nwat did i miss"),
+    ("am bored", "same\ntalk to me then hehehe"),
+    ("goodnight", "goodnight boo\nsleep tight"),
+]
+
+
+def _flirt_mode(contact: dict | None = None) -> str:
+    """Per-contact "flirt": "light" | "full" (true means light). Anything else, or nobody, means "off"."""
+    value = (contact or {}).get("flirt")
+    if value is True:
+        return "light"
+    mode = str(value or "off").strip().lower()
+    return mode if mode in FLIRT_RULES else "off"
+
+
+def _flirt_block(contact: dict | None = None) -> str:
+    mode = _flirt_mode(contact)
+    if mode == "off":
+        return ""
+    text = FLIRT_RULES[mode]
+    if FLIRT_EXAMPLES:
+        text += "\n\nExamples of how I flirt (short, relaxed, my voice):\n\n" + "\n\n".join(
+            f"{EXAMPLE_LABEL_THEM}: {them}\n{EXAMPLE_LABEL_ME}: {me}" for them, me in FLIRT_EXAMPLES
+        )
+    return text
 
 
 def _now_text() -> str:
@@ -177,6 +312,10 @@ def build_system_prompt(contact: dict | None = None) -> str:
     )
     parts.append(f"Current date and time: {_now_text()}.")
     parts.append(RULES)
+    flirt = _flirt_block(contact)  # only for people switched on in contacts.json
+    if flirt:
+        parts.append(flirt)
+    parts.append(_apology_block(contact))  # last, so it wins over anything above it (flirting included)
     return "\n\n".join(parts)
 
 
@@ -240,6 +379,8 @@ MAX_REPLIES_PER_HOUR = _env_int("MAX_REPLIES_PER_HOUR", 30)  # per contact, loop
 HANDOFF_MINUTES = _env_int("HANDOFF_MINUTES", 60)  # pause a chat this long after YOU reply by hand
 MAX_MESSAGE_AGE = _env_int("MAX_MESSAGE_AGE_SECONDS", 900)  # ignore older (e.g. delivered after a restart)
 NOTIFY_NUMBER = _digits(os.getenv("NOTIFY_NUMBER", ""))  # your own number: get a note when the bot skips
+APOLOGY_MODE = os.getenv("APOLOGY_MODE", "light").strip().lower()  # off | light | full (see "Apologies" above)
+APOLOGY_NOTIFY = _env_bool("APOLOGY_NOTIFY", True)  # tell NOTIFY_NUMBER whenever the bot says sorry for you
 TIMEZONE = os.getenv("TIMEZONE", "Africa/Kampala").strip()
 SPLIT_MESSAGES = _env_bool("SPLIT_MESSAGES", True)  # one WhatsApp bubble per line
 MAX_BUBBLES = _env_int("MAX_BUBBLES", 3)
@@ -258,6 +399,14 @@ def validate_config() -> None:
         problems.append("GEMINI_API_KEY is not set")
     if REPLY_MODE not in ("whitelist", "all"):
         problems.append(f"REPLY_MODE must be 'whitelist' or 'all' (got {REPLY_MODE!r})")
+    if APOLOGY_MODE not in APOLOGY_RULES:
+        problems.append(f"APOLOGY_MODE must be 'off', 'light' or 'full' (got {APOLOGY_MODE!r})")
+    if APOLOGY_MODE != "off" and APOLOGY_NOTIFY and not NOTIFY_NUMBER:
+        log.warning(
+            "APOLOGY_MODE=%s but NOTIFY_NUMBER is empty: the bot will say sorry for you without telling you. "
+            "Set NOTIFY_NUMBER to your own number to get a note each time.",
+            APOLOGY_MODE,
+        )
     if REPLY_MODE == "whitelist" and not WHITELIST:
         problems.append(
             "WHITELIST is empty - the bot will not reply to anyone "
@@ -285,7 +434,7 @@ def validate_config() -> None:
         )
     for problem in problems:
         log.error("CONFIG: %s", problem)
-    if not GEMINI_API_KEY or REPLY_MODE not in ("whitelist", "all"):
+    if not GEMINI_API_KEY or REPLY_MODE not in ("whitelist", "all") or APOLOGY_MODE not in APOLOGY_RULES:
         raise SystemExit("Invalid configuration, see the CONFIG errors above")
 
 
@@ -336,6 +485,91 @@ def _read_json(filename: str):
         return None
 
 
+def _int_or_zero(value) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _merge_group(group: list[dict]) -> dict:
+    """Merge contacts.json entries that share a phone number into one entry."""
+    if len(group) == 1:
+        return group[0]
+    primary = max(group, key=lambda e: _int_or_zero(e.get("messages")))  # biggest chat; ties -> first
+    others = [e for e in group if e is not primary]
+    merged = dict(primary)
+
+    # The other chats' names (and any aliases they had) become aliases of the merged entry.
+    names = {_norm_name(primary["name"])}
+    aliases: list[str] = []
+    for entry in (primary, *others):
+        candidates = [str(a) for a in entry.get("aliases") or []]
+        if entry is not primary:
+            candidates.insert(0, entry["name"])
+        for name in candidates:
+            if _norm_name(name) and _norm_name(name) not in names:
+                names.add(_norm_name(name))
+                aliases.append(name)
+    if aliases:
+        merged["aliases"] = aliases
+
+    numbers: list = []
+    seen_digits: set[str] = set()
+    for entry in group:
+        for number in entry.get("numbers") or []:
+            if _digits(str(number)) not in seen_digits:
+                seen_digits.add(_digits(str(number)))
+                numbers.append(number)
+    merged["numbers"] = numbers
+    merged["messages"] = sum(_int_or_zero(e.get("messages")) for e in group)
+
+    examples: list = []
+    seen_pairs: set[tuple[str, str]] = set()
+    for row in zip_longest(*[e.get("examples") or [] for e in (primary, *others)]):  # take turns, biggest chat first
+        for pair in row:
+            if isinstance(pair, (list, tuple)) and len(pair) == 2 and (str(pair[0]), str(pair[1])) not in seen_pairs:
+                seen_pairs.add((str(pair[0]), str(pair[1])))
+                examples.append(pair)
+    merged["examples"] = examples  # "recent" stays the biggest chat's own
+
+    notes: list[str] = []
+    for entry in (primary, *others):
+        note = str(entry.get("notes") or "").strip()
+        if note and note not in notes:
+            notes.append(note)
+    merged["notes"] = " ".join(notes)
+    merged["apology"] = next((e["apology"] for e in (primary, *others) if e.get("apology")), "")
+    merged["flirt"] = next((e["flirt"] for e in (primary, *others) if e.get("flirt")), "")
+    return merged
+
+
+def _merge_same_number(entries: list[dict]) -> list[dict]:
+    """Entries that share a phone number are one WhatsApp account (e.g. the same person exported
+    twice under two saved names). Merge them so neither chat's context is silently lost."""
+    groups: list[list[dict]] = []
+    group_of: dict[str, list[dict]] = {}
+    for entry in entries:
+        digits = [d for d in (_digits(str(n)) for n in entry.get("numbers") or []) if d]
+        group = next((group_of[d] for d in digits if d in group_of), None)
+        if group is None:
+            group = []
+            groups.append(group)
+        group.append(entry)
+        for d in digits:
+            group_of[d] = group
+    result = []
+    for group in groups:
+        merged = _merge_group(group)
+        if len(group) > 1:
+            log.warning(
+                "contacts.json: %s share a phone number, so they are treated as one person (merged as %r)",
+                ", ".join(repr(e["name"]) for e in group), merged["name"],
+            )
+        result.append(merged)
+    return result
+
+
 def load_knowledge() -> None:
     global PROFILE_TEXT, STYLE_TEXT, FEW_SHOT_EXAMPLES
     PROFILE_TEXT = _read_text("profile.md", 12000)
@@ -352,14 +586,27 @@ def load_knowledge() -> None:
 
     data = _read_json("contacts.json")
     entries = data.get("contacts", []) if isinstance(data, dict) else (data or [])
+    entries = [e for e in entries if isinstance(e, dict) and e.get("name")]
     CONTACTS.clear()
     CONTACTS_BY_NUMBER.clear()
     CONTACTS_BY_NAME.clear()
-    for entry in entries:
-        if not isinstance(entry, dict) or not entry.get("name"):
-            continue
+    for entry in _merge_same_number(entries):
         CONTACTS.append(entry)
         CONTACTS_BY_NAME[_norm_name(entry["name"])] = entry
+        for alias in entry.get("aliases") or []:  # other names the same person is saved under
+            if _norm_name(str(alias)):
+                CONTACTS_BY_NAME.setdefault(_norm_name(str(alias)), entry)
+        if entry.get("apology") and str(entry["apology"]).strip().lower() not in APOLOGY_RULES:
+            log.warning(
+                "contacts.json: %r has apology=%r (use off, light or full); the bot will not apologise to them",
+                entry["name"], entry["apology"],
+            )
+        flirt = entry.get("flirt")
+        if flirt and flirt is not True and str(flirt).strip().lower() not in ("off", *FLIRT_RULES):
+            log.warning(
+                "contacts.json: %r has flirt=%r (use off, light or full); the bot will not flirt with them",
+                entry["name"], flirt,
+            )
         for number in entry.get("numbers") or []:
             if _digits(str(number)):
                 CONTACTS_BY_NUMBER[_digits(str(number))] = entry
@@ -394,13 +641,37 @@ def get_gemini() -> genai.Client:
         return _gemini_client
 
 
+_thinking_rejected = False  # set if the API refuses our thinking setting; we then stop sending it
+
+
+def _thinking_config() -> types.ThinkingConfig | None:
+    """Casual texts do not need long reasoning, and thinking tokens eat the output budget.
+    Gemini 2.5 can switch thinking off (thinking_budget=0). Gemini 3.x cannot: it has levels
+    (thinking_level) instead, so we ask for the low one. Other models: Google's default."""
+    if _thinking_rejected:
+        return None
+    model = GEMINI_MODEL.lower()
+    try:
+        if "gemini-2.5" in model:
+            return types.ThinkingConfig(thinking_budget=0)
+        if "gemini-3" in model:
+            return types.ThinkingConfig(thinking_level="low")
+    except Exception:  # an older google-genai without thinking_level
+        log.warning("This google-genai version does not support the thinking setting for %s; using the default", model)
+    return None
+
+
 def _generation_config(contact: dict | None = None) -> types.GenerateContentConfig:
+    thinking = _thinking_config()
+    # With thinking OFF a short cap is fine. Otherwise the thinking tokens count against the cap too,
+    # and 200 could leave nothing for the reply itself.
+    max_tokens = 200 if thinking is not None and getattr(thinking, "thinking_budget", None) == 0 else 1024
+    kwargs = {"thinking_config": thinking} if thinking is not None else {}
     return types.GenerateContentConfig(
         system_instruction=build_system_prompt(contact),
         temperature=0.9,
-        max_output_tokens=200,
-        # Thinking is wasted on casual texts and would eat the output budget.
-        thinking_config=types.ThinkingConfig(thinking_budget=0),
+        max_output_tokens=max_tokens,
+        **kwargs,
     )
 
 
@@ -436,6 +707,7 @@ def generate_reply(
 ) -> str | None:
     """Ask Gemini for a reply. Returns None if it should stay silent, or SKIP_TOKEN
     if the model decided a human (you) should handle it."""
+    global _thinking_rejected
     contents = build_contents(history, incoming)
     config = _generation_config(contact)
 
@@ -455,6 +727,12 @@ def generate_reply(
 
         except genai_errors.APIError as err:
             code = getattr(err, "code", None)
+            if code == 400 and "thinking" in str(err).lower() and not _thinking_rejected:
+                # The model does not accept our thinking setting (e.g. a new Gemini version): drop it, try again.
+                _thinking_rejected = True
+                log.warning("Gemini rejected the thinking setting for %s; retrying without it", GEMINI_MODEL)
+                config = _generation_config(contact)
+                continue
             retryable = code == 429 or (isinstance(code, int) and code >= 500)
             if not retryable:
                 log.error("Gemini error %s (not retryable): %s", code, err)
@@ -552,6 +830,23 @@ def _notify_owner(wa: NewClient, chat: ChatState, incoming: str) -> None:
         log.debug("owner notification failed", exc_info=True)
 
 
+def _notify_apology(wa: NewClient, chat: ChatState, incoming: str, reply: str) -> None:
+    """Tell you (a WhatsApp message to your own number) that the bot said sorry in your name,
+    so you can follow up yourself if it matters."""
+    if not (APOLOGY_NOTIFY and NOTIFY_NUMBER and build_jid is not None):
+        return
+    if not _APOLOGY_RE.search(reply):
+        return
+    try:
+        snippet = incoming if len(incoming) <= 300 else incoming[:300] + "..."
+        wa.send_message(
+            build_jid(NOTIFY_NUMBER),
+            f"i said sorry for you - {chat.display}:\nthem: {snippet}\nme: {reply}",
+        )
+    except Exception:
+        log.debug("apology notification failed", exc_info=True)
+
+
 def _note_owner_activity(chat_id: str) -> None:
     """You typed in this chat yourself -> the bot stays out of it for a while."""
     if HANDOFF_MINUTES <= 0:
@@ -604,6 +899,9 @@ def _process_chat(wa: NewClient, key: str) -> None:
             chat.history.append(("model", reply))
             chat.sent_at.append(time.time())
             log.info("[%s] reply sent (%d chars)", chat.display or key, len(reply))
+            if _apology_mode(chat.contact) != "off" and _APOLOGY_RE.search(reply):
+                log.info("[%s] said sorry for me (apology mode: %s)", chat.display or key, _apology_mode(chat.contact))
+                _notify_apology(wa, chat, incoming, reply)
     except Exception:
         log.exception("[%s] failed while processing chat", key)
     finally:
@@ -905,14 +1203,17 @@ def health():
 def main() -> None:
     validate_config()
     log.info(
-        "Starting: model=%s mode=%s whitelist=%d blocklist=%d delay=%.0f-%.0fs",
-        GEMINI_MODEL, REPLY_MODE, len(WHITELIST), len(BLOCKLIST), MIN_DELAY, MAX_DELAY,
+        "Starting: model=%s mode=%s whitelist=%d blocklist=%d delay=%.0f-%.0fs apologies=%s",
+        GEMINI_MODEL, REPLY_MODE, len(WHITELIST), len(BLOCKLIST), MIN_DELAY, MAX_DELAY, APOLOGY_MODE,
     )
     log.info(
         "Knowledge pack (%s or %s): profile=%d chars, %d contact(s), %d example(s)%s",
         KNOWLEDGE_DIR, SECRETS_DIR, len(PROFILE_TEXT), len(CONTACTS), len(FEW_SHOT_EXAMPLES),
         "" if PROFILE_TEXT or CONTACTS else "  [empty: run build_knowledge.py to teach it your life]",
     )
+    flirty = [c["name"] for c in CONTACTS if _flirt_mode(c) != "off"]
+    if flirty:
+        log.info("Flirting is switched on for %d contact(s)", len(flirty))
     threading.Thread(target=_run_whatsapp, name="whatsapp", daemon=True).start()
     threading.Thread(target=_watchdog, name="watchdog", daemon=True).start()
 

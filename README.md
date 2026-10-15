@@ -18,6 +18,8 @@ Cloud API. It is designed to run on Render's free tier, kept awake by UptimeRobo
 | Delay | Random 5-15 s (`MIN_DELAY_SECONDS` / `MAX_DELAY_SECONDS`) before every reply, plus a short "typing..." pause. Messages that arrive during the wait are merged into one reply. |
 | You take over | If you type in a chat yourself, the bot stays out of it for `HANDOFF_MINUTES` (default 60) and cancels any reply it was about to send. |
 | Stays silent when unsure | The model is told to output `[SKIP]` for money/OTP/password requests, spam, strangers, serious or emotional topics, "are you a bot?", or anything it is unsure about. Nothing is sent. If `NOTIFY_NUMBER` is set, you get a WhatsApp note with the message so you can answer yourself. |
+| Says sorry for you | `APOLOGY_MODE=light` (default): a short, general "sorry" in your style when someone says you were slow, dry, ignoring them or missed a call. `full` also answers people who are properly upset; `off` never apologises. Serious fights, accusations, break-ups, money and health always go to `[SKIP]`. You get a WhatsApp note whenever it apologised. See section 2b. |
+| Flirts (only where you allow it) | Only with people you switch on in `contacts.json` (`"flirt": "light"` or `"full"`). Never sexual, never claims you are single or exclusive, and it stays silent (`[SKIP]`, you get a note) when someone asks "what are we?", about other girls or whether you love them. See section 2c. |
 | Never invents your life | Rules forbid guessing facts, agreeing to meet/pay/lend, or revealing other people's chats. It is told today's date and time (`TIMEZONE`). |
 | Stale messages | Messages older than `MAX_MESSAGE_AGE_SECONDS` (default 15 min), e.g. delivered after a restart, are ignored instead of answered hours late. |
 | Gemini 429 / 5xx | Waits and retries (uses Gemini's own "retry in Ns" hint when present, otherwise exponential back-off), up to `GEMINI_MAX_RETRIES`. If it still fails, or the quota is daily, the bot stays silent instead of sending an error. |
@@ -59,6 +61,74 @@ then widen it.
 Answering everyone is riskier than a whitelist: more conversations means more chances for a wrong or
 out-of-character reply, and more outgoing volume for WhatsApp to look at.
 
+## 2b. Let it say sorry for you
+
+An apology is a statement in your name, so it is limited on purpose. Pick how far it may go with
+`APOLOGY_MODE` (default `light`), or per person with `"apology"` in `knowledge/contacts.json`
+(the per-person value wins):
+
+| Mode | What the bot does |
+|---|---|
+| `off` | Never says sorry for you and never answers someone else's sorry. It stays silent (`[SKIP]`) and you get a note. |
+| `light` | Says a tiny, general sorry for **small everyday slips only**: slow or dry replies, a missed call, a mix-up, "why are you ignoring me". If they say sorry to you for something small, it answers "its ok". |
+| `full` | Also sends a short, sincere sorry when someone is properly annoyed or hurt ("didnt mean to make u feel that way"). |
+
+In every mode it **never** explains or invents a reason ("i was busy", "my phone died"), never promises anything
+("wont happen again", "ill call you", no money), and never admits to a specific fault. Accusations of lying or
+cheating, talk of ending things, threats, money owed either way, health, family or legal trouble, and demands
+for an explanation or a promise are always left to you (`[SKIP]`).
+
+- **You are told.** With `NOTIFY_NUMBER` set and `APOLOGY_NOTIFY=true` (default) you get a WhatsApp note each time
+  the bot said sorry: what they wrote and what it answered, so you can follow up yourself. The log line is
+  `said sorry for me`. Sympathy ("sory about that" when they had a bad day) triggers a note too.
+- **Per person**, in `contacts.json`:
+  ```json
+  { "name": "Amina", "numbers": ["256701234567"], "apology": "full" }
+  { "name": "Brian", "apology": "off" }
+  ```
+  A good use of `"off"` is anyone you are in a money or other serious dispute with, so the bot cannot concede
+  anything to them.
+- **Make it sound like you.** Edit `APOLOGY_EXAMPLES` in `main.py` (next to `STYLE_INSTRUCTIONS`) and replace the
+  neutral templates with real apologies from your own chats (search your chats for "sorry" / "sory").
+
+## 2c. Flirting
+
+Flirting is **off for everybody** until you switch it on for a person in `knowledge/contacts.json`. There is no
+global switch, so family, friends, colleagues and strangers can never get a flirty reply.
+
+```json
+{ "name": "Amina", "numbers": ["256701234567"], "flirt": "light" }
+```
+
+| Value | Style |
+|---|---|
+| `"light"` (or `true`) | Sweet and playful: warm teasing, affection, a small specific compliment, a question about their day. |
+| `"full"` | Bolder: cheeky teasing, playful challenges, flirty banter. |
+| missing / `"off"` | No flirting. |
+
+What it does: flirts back when they flirt or the chat is already warm, keeps your usual voice, spelling and pet
+name for that person, stays short, and never goes warmer than your real chat history with them (no new pet names,
+no "i love you" you have not already said to them).
+
+What it never does:
+- anything sexual or explicit, or asking for or promising photos
+- flirting with anyone who might be under 18, who seems uncomfortable or says stop, or when the topic is serious
+  (it stays silent instead); if they are upset it follows the apology rules instead
+- claiming you are single or that they are the only one, or mentioning or hinting at any other person or chat. If
+  they ask about other girls, exclusivity, commitment, "what are we" or whether you love them, it stays silent and
+  you get a note, so those answers are always yours
+- plans, promises or money
+
+**Several people at once.** Put anything the bot must know about a person in that person's `"notes"`, for example
+that this chat is separate from your other relationships and that names, pet names and details must never be mixed
+up between chats. A person's prompt contains only that person's notes, examples and recent messages, plus the
+shared `profile.md` and the general `examples.json` (which are drawn from all your chats, so keep private details
+out of them), and the live chat memory is kept per person. Keep these notes in `contacts.json` (a Render Secret
+File), not in `main.py`, because the code may be on GitHub.
+
+Replace the neutral `FLIRT_EXAMPLES` in `main.py` with a few real lines of yours. The real examples in each
+person's `contacts.json` entry matter more anyway.
+
 ## 3. Teach it your life (knowledge pack)
 
 The bot cannot "read all your chats" live. Instead you export them once, a script boils them down, and the
@@ -97,7 +167,12 @@ but check anyway.
 **d) Tell it who is who.** Open `knowledge/contacts.json` and fill in each person's `"numbers"`, e.g.
 `"numbers": ["256701234567"]`. Without numbers the bot can still recognise a contact whose WhatsApp profile
 name equals their saved name, or whose saved name is just a phone number. Your entries are kept when you
-re-run the script.
+re-run the script. Numbers may be written as text or as plain numbers; both work. If two entries share a
+number (the same person exported twice under two saved names), the bot merges them into one contact and
+logs a warning. You can also add `"aliases": ["other saved name"]`, `"apology": "off|light|full"` (section 2b) and
+`"flirt": "off|light|full"` (section 2c) to an entry. A re-run keeps `numbers`, `aliases`, `apology` and `flirt`, but
+a re-run **with** the AI step replaces `notes` with new ones written by Gemini: copy your hand-written notes
+somewhere first, or re-run with `--no-llm`.
 
 **e) Give it to the bot**, either way:
 
@@ -130,11 +205,13 @@ If a file exists in both places, `knowledge/` wins.
 | `ONLY_KNOWN_CONTACTS` | no | In `all` mode, only answer people found in `contacts.json`. Default `false`. |
 | `DATABASE_URL` | yes on Render free | Postgres connection string where the WhatsApp session is stored (see below). Without it the session goes to a local SQLite file that Render deletes on every restart. |
 | `NOTIFY_NUMBER` | recommended | **Your own** number. When the bot skips a message you get a WhatsApp note. |
+| `APOLOGY_MODE` | no | `off`, `light` (default) or `full`. See section 2b. |
+| `APOLOGY_NOTIFY` | no | Default `true`: with `NOTIFY_NUMBER` set, you get a note whenever the bot said sorry for you. |
 | `HANDOFF_MINUTES` | no | Pause a chat this long after you reply by hand. Default `60`, `0` disables. |
 | `MAX_MESSAGE_AGE_SECONDS` | no | Ignore older messages. Default `900`. |
 | `TIMEZONE` | no | Default `Africa/Kampala`. |
 | `PAGE_KEY` | recommended | If set, the QR is only shown at `/?key=<PAGE_KEY>`. Stops a stranger from scanning your QR first and linking *their* account to your bot. |
-| `GEMINI_MODEL` | no | Default `gemini-2.5-flash`. |
+| `GEMINI_MODEL` | no | Default `gemini-2.5-flash`. Google retires models, so check [the models page](https://ai.google.dev/gemini-api/docs/models) if you get 404s. Gemini 2.5 runs with thinking off, Gemini 3.x with `thinking_level=low` (it has no "off"); if the API rejects that setting, the bot drops it by itself. |
 | `MIN_DELAY_SECONDS` / `MAX_DELAY_SECONDS` | no | Default `5` / `15`. |
 | `MAX_HISTORY_MESSAGES` | no | Default `12`. |
 | `MAX_REPLIES_PER_HOUR` | no | Default `30` per contact. |
@@ -144,7 +221,7 @@ If a file exists in both places, `knowledge/` wins.
 | `KNOWLEDGE_DIR` / `SECRETS_DIR` | no | Defaults `knowledge` and `/etc/secrets`. |
 | `SESSION_NAME` | no | Default `clone-bot`. |
 | `SQLITE_PATH` | no | Local session file when `DATABASE_URL` is empty. Default `session.db`. |
-| `LOG_LEVEL` | no | Default `INFO`. |
+| `LOG_LEVEL` | no | Default `INFO`. `DEBUG` also shows every Gemini HTTP call (muted otherwise). |
 | `PORT` | no | Render sets this automatically. Default `10000`. |
 
 ### Getting a free Postgres
@@ -218,6 +295,14 @@ service restarts itself and shows a new QR.
 
 **Gemini 429 in the logs.** Normal on the free Gemini tier. The bot waits and retries. If the quota is
 exhausted for the day it gives up on that message and stays silent.
+
+**Gemini 503 in the logs** (`Gemini 503 (attempt 1/5) - waiting 5.7s then retrying`). Google's side is
+overloaded for that model; it is not a bug in the bot. It retries with growing waits (about 5, 9, 17, 33 s) and
+gives up on that message after `GEMINI_MAX_RETRIES` attempts (`giving up`, nothing is sent). If it happens a lot,
+switch `GEMINI_MODEL` to another current Flash model. A wrong model name gives a 404, not a 503.
+
+**A contact complains the bot never says sorry / says sorry too often.** Check `APOLOGY_MODE` and that person's
+`"apology"` value in `contacts.json`. The log line `said sorry for me` shows each apology that was sent.
 
 **`build_knowledge.py` says it cannot tell which sender is you.** Pass `--me "Your Name"` exactly as it appears
 in the exports.
